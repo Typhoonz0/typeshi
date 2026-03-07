@@ -1,0 +1,5 @@
+numpy==2.4.2
+pygame==2.6.1
+pygltflib==1.16.5
+PyOpenGL==3.1.9
+PyOpenGL==3.1.10
