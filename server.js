@@ -703,7 +703,7 @@ buildSpawnPoints();
 
 const httpServer = http.createServer((req, res) => {
   res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("FPS server running\n");
+  res.end(` server running on port ${port}\n`);
 });
 
 const wss = new WebSocket.Server({ server: httpServer });
