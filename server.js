@@ -4,40 +4,46 @@
  * npm install ws
  * node server.js [map.gltf] [--port 7777]
  *
- * Drop-in replacement for server.py — same WebSocket protocol,
- * same message types, same snapshot format.
- * Positions are trusted from the client; server only does
- * hitscan + wall-occlusion + health/kill tracking.
+ * Multi-weapon support:
+ *   Pistol  — 25 dmg
+ *   AR      — 18 dmg (auto)
+ *   Sniper  — 100 dmg (one-shot kill)
  */
 
 "use strict";
 
+const http      = require("http");
 const WebSocket = require("ws");
 const fs        = require("fs");
 const path      = require("path");
 
 // ══════════════════════════════════════════════════════════════════════════════
-// CONFIG  (must match client)
+// CONFIG
 // ══════════════════════════════════════════════════════════════════════════════
 const TICK_RATE      = 60;
 const BROADCAST_RATE = 20;
 const DEFAULT_PORT   = 7777;
 
-const GRAVITY         = 0.0028;
-const JUMP_VEL        = 0.10;
-const P_H             = 1.8;
-const P_R             = 0.38;
-const EYE             = 1.62;
-const MAP_SCALE       = 2.0;
-const BULLET_DAMAGE   = 25;
-const RESPAWN_TICKS   = 120;
+const P_H       = 1.8;
+const P_R       = 0.38;
+const EYE       = 1.62;
+const MAP_SCALE = 2.0;
+
+const RESPAWN_TICKS = 120;
+
+// Per-weapon damage
+const WEAPON_DAMAGE = {
+  pistol: 25,
+  ar:     8,
+  sniper: 100,
+};
+const DEFAULT_DAMAGE = 25;
 
 // ══════════════════════════════════════════════════════════════════════════════
 // MATH HELPERS
 // ══════════════════════════════════════════════════════════════════════════════
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 
-function vec3(x, y, z) { return [x, y, z]; }
 function vsub(a, b) { return [a[0]-b[0], a[1]-b[1], a[2]-b[2]]; }
 function vadd(a, b) { return [a[0]+b[0], a[1]+b[1], a[2]+b[2]]; }
 function vdot(a, b) { return a[0]*b[0] + a[1]*b[1] + a[2]*b[2]; }
@@ -55,8 +61,8 @@ function vnorm(a) {
 class TriGrid {
   constructor(cell = 3.0) {
     this.cell    = cell;
-    this.buckets = new Map(); // "gx,gz" → int[]
-    this.tris    = [];        // [ [[x,y,z],[x,y,z],[x,y,z]], ... ]
+    this.buckets = new Map();
+    this.tris    = [];
   }
 
   build(triangles) {
@@ -102,20 +108,6 @@ class TriGrid {
 
 const TRI_GRID = new TriGrid();
 
-// ── point-in-triangle (barycentric) ──────────────────────────────────────────
-function pointInTri(p, a, b, c) {
-  const v0 = vsub(c, a), v1 = vsub(b, a), v2 = vsub(p, a);
-  const d00 = vdot(v0,v0), d01 = vdot(v0,v1), d02 = vdot(v0,v2);
-  const d11 = vdot(v1,v1), d12 = vdot(v1,v2);
-  const denom = d00*d11 - d01*d01;
-  if (Math.abs(denom) < 1e-12) return false;
-  const inv = 1.0 / denom;
-  const u   = (d11*d02 - d01*d12) * inv;
-  const v   = (d00*d12 - d01*d02) * inv;
-  return u >= -0.01 && v >= -0.01 && u+v <= 1.02;
-}
-
-// ── ray vs triangle (Möller–Trumbore) ────────────────────────────────────────
 function rayTriDist(ro, rd, a, b, c) {
   const e1 = vsub(b, a), e2 = vsub(c, a);
   const h  = vcross(rd, e2);
@@ -132,7 +124,6 @@ function rayTriDist(ro, rd, a, b, c) {
   return t > 0.05 ? t : null;
 }
 
-// ── hitscan ray vs map geometry ───────────────────────────────────────────────
 function raycastHitscan(ox, oy, oz, dx, dy, dz, maxDist = 400) {
   const tris = TRI_GRID.tris;
   if (!tris.length) return null;
@@ -140,8 +131,6 @@ function raycastHitscan(ox, oy, oz, dx, dy, dz, maxDist = 400) {
   if (dlen < 1e-9) return null;
   const rdx = dx/dlen, rdy = dy/dlen, rdz = dz/dlen;
   const ro = [ox, oy, oz], rd = [rdx, rdy, rdz];
-
-  // Collect candidate triangles along ray path
   const steps = [0, maxDist*0.25, maxDist*0.5, maxDist*0.75, maxDist];
   const seen  = new Set();
   const idxs  = [];
@@ -150,7 +139,6 @@ function raycastHitscan(ox, oy, oz, dx, dy, dz, maxDist = 400) {
       if (!seen.has(i)) { seen.add(i); idxs.push(i); }
     }
   }
-
   let best = null;
   for (const i of idxs) {
     const [a, b, c] = tris[i];
@@ -163,7 +151,7 @@ function raycastHitscan(ox, oy, oz, dx, dy, dz, maxDist = 400) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// GLTF MAP LOADING  (geometry only, no GL)
+// GLTF MAP LOADING
 // ══════════════════════════════════════════════════════════════════════════════
 let aabbMin = null, aabbMax = null;
 
@@ -173,13 +161,11 @@ function loadMap(filePath) {
     return false;
   }
   console.log(`[SERVER] Loading map '${filePath}' …`);
-
   let raw;
   try { raw = fs.readFileSync(filePath); }
   catch(e) { console.error("[SERVER] Failed to read map:", e.message); return false; }
 
   let gltf;
-  // Handle both .gltf (JSON) and .glb (binary)
   if (filePath.endsWith(".glb")) {
     gltf = parseGLB(raw);
   } else {
@@ -212,7 +198,6 @@ function loadMap(filePath) {
     const ao   = acc.byteOffset || 0;
     const sz   = Ctor.BYTES_PER_ELEMENT * nc;
     const arr  = new Ctor(raw.buffer, raw.byteOffset + bo + ao, acc.count * nc);
-    // Convert to float32
     if (Ctor === Float32Array) return arr;
     const f = new Float32Array(arr.length);
     for (let i = 0; i < arr.length; i++) f[i] = arr[i];
@@ -221,7 +206,6 @@ function loadMap(filePath) {
 
   function nodeMat(node) {
     if (node.matrix) {
-      // column-major → row-major
       const m = node.matrix;
       return [
         [m[0],m[4],m[8], m[12]],
@@ -302,12 +286,12 @@ function loadMap(filePath) {
       if (mode === 4) {
         for (let i = 0; i+2 < idxArr.length; i += 3)
           triangles.push([pts[idxArr[i]], pts[idxArr[i+1]], pts[idxArr[i+2]]]);
-      } else if (mode === 5) { // triangle strip
+      } else if (mode === 5) {
         for (let i = 0; i+2 < idxArr.length; i++) {
           if (i%2===0) triangles.push([pts[idxArr[i]], pts[idxArr[i+1]], pts[idxArr[i+2]]]);
           else         triangles.push([pts[idxArr[i+1]], pts[idxArr[i]], pts[idxArr[i+2]]]);
         }
-      } else if (mode === 6) { // triangle fan
+      } else if (mode === 6) {
         for (let i = 1; i+1 < idxArr.length; i++)
           triangles.push([pts[idxArr[0]], pts[idxArr[i]], pts[idxArr[i+1]]]);
       }
@@ -331,7 +315,6 @@ function loadMap(filePath) {
 }
 
 function parseGLB(buf) {
-  // GLB header: magic(4) version(4) length(4)
   const magic = buf.readUInt32LE(0);
   if (magic !== 0x46546C67) throw new Error("Not a GLB file");
   let offset = 12;
@@ -350,15 +333,40 @@ function parseGLB(buf) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// SPAWN POSITION
+// SPAWN POINTS
 // ══════════════════════════════════════════════════════════════════════════════
+const SPAWN_OFFSETS = [
+  [ 0.0,  0.0], [ 0.15,  0.15], [ 0.2,  0.0]
+];
+
+let spawnPoints = [];
+
+function buildSpawnPoints() {
+  if (!aabbMin || !aabbMax) { spawnPoints = [[0,4,0]]; return; }
+  const cx = (aabbMin[0]+aabbMax[0])/2;
+  const cz = (aabbMin[2]+aabbMax[2])/2;
+  const rx = (aabbMax[0]-aabbMin[0]) * 0.5;
+  const rz = (aabbMax[2]-aabbMin[2]) * 0.5;
+  const sy = aabbMax[1] + 4.0;
+  spawnPoints = SPAWN_OFFSETS.map(([ox,oz]) => [cx+ox*rx*2, sy, cz+oz*rz*2]);
+  console.log(`[SERVER] ${spawnPoints.length} spawn points built`);
+}
+
 function spawnPos() {
-  if (aabbMin && aabbMax) {
-    const cx = (aabbMin[0]+aabbMax[0])/2;
-    const cz = (aabbMin[2]+aabbMax[2])/2;
-    return [cx, aabbMax[1]+4.0, cz];
+  if (!spawnPoints.length) return [0, 4, 0];
+  const alive = [...players.values()].filter(p => p.alive);
+  if (!alive.length) return [...spawnPoints[Math.floor(Math.random() * spawnPoints.length)]];
+  let bestPt = spawnPoints[0], bestDist = -1;
+  for (const pt of spawnPoints) {
+    let minDist = Infinity;
+    for (const p of alive) {
+      const dx = pt[0]-p.pos[0], dz = pt[2]-p.pos[2];
+      const d = Math.sqrt(dx*dx+dz*dz);
+      if (d < minDist) minDist = d;
+    }
+    if (minDist > bestDist) { bestDist = minDist; bestPt = pt; }
   }
-  return [0, 4, 0];
+  return [...bestPt];
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -377,6 +385,7 @@ class ServerPlayer {
     this.deaths = 0;
     this.respawnTimer = 0;
     this.sliding = false;
+    this.weapon  = "pistol";   // currently held weapon (cosmetic for server)
     this.inp    = null;
     this.ws     = null;
   }
@@ -400,7 +409,6 @@ class ServerPlayer {
         this.pos    = spawnPos();
       }
     }
-    // Update yaw/pitch from latest input
     if (this.inp) {
       if (this.inp.yaw   != null) this.yaw   = this.inp.yaw;
       if (this.inp.pitch != null) this.pitch = this.inp.pitch;
@@ -409,7 +417,8 @@ class ServerPlayer {
         this.pos[1] = this.inp.y;
         this.pos[2] = this.inp.z;
       }
-      if (this.inp.slide != null) this.sliding = this.inp.slide;
+      if (this.inp.slide  != null) this.sliding = this.inp.slide;
+      if (this.inp.weapon != null) this.weapon  = this.inp.weapon;
     }
   }
 
@@ -423,6 +432,7 @@ class ServerPlayer {
       yaw:      +this.yaw.toFixed(2),
       pitch:    +this.pitch.toFixed(2),
       sliding:  this.sliding,
+      weapon:   this.weapon,
       health:   this.health,
       alive:    this.alive,
       kills:    this.kills,
@@ -432,15 +442,17 @@ class ServerPlayer {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// HITSCAN
+// HITSCAN  — damage amount depends on weapon
 // ══════════════════════════════════════════════════════════════════════════════
-function processShoot(shooter, players, yaw, pitch) {
+function processShoot(shooter, players, yaw, pitch, weapon) {
   const yr = yaw   * Math.PI / 180;
   const pr = pitch * Math.PI / 180;
   const dx =  Math.cos(pr) * Math.sin(yr);
   const dy =  Math.sin(pr);
   const dz = -Math.cos(pr) * Math.cos(yr);
   const eye = [shooter.pos[0], shooter.pos[1] + EYE*0.9, shooter.pos[2]];
+
+  const damage = WEAPON_DAMAGE[weapon] || DEFAULT_DAMAGE;
 
   const hits = [];
   for (const [pid, p] of players) {
@@ -458,28 +470,108 @@ function processShoot(shooter, players, yaw, pitch) {
     if (t < 0 || t > 300) continue;
     const hy = eye[1] + dy*t;
     if (hy < cy || hy > cy+capH) continue;
-    // Wall occlusion
+
+    // Wall occlusion check
     const wallT = raycastHitscan(eye[0], eye[1], eye[2], dx, dy, dz, t+0.5);
     if (wallT !== null && wallT < t - 0.3) continue;
+
     hits.push([t, pid]);
   }
 
   hits.sort((a,b) => a[0]-b[0]);
+
   const hitPids = [];
   for (const [, pid] of hits) {
     const p = players.get(pid);
-    p.takeDamage(BULLET_DAMAGE);
+    const wasAlive = p.alive;
+    p.takeDamage(damage);
     hitPids.push(pid);
-    if (p.health <= 0) shooter.kills++;
-    break; // one hit per shot
+    if (wasAlive && !p.alive) shooter.kills++;
+    break; // one target per shot
   }
   return hitPids;
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// SERVER STATE
+// PERSISTENT LEADERBOARD
 // ══════════════════════════════════════════════════════════════════════════════
-const players     = new Map();  // pid → ServerPlayer
+const leaderboard = new Map();
+
+function lbAdd(name, kills, deaths) {
+  const e = leaderboard.get(name) || { kills:0, deaths:0, rounds:0 };
+  e.kills  += kills;
+  e.deaths += deaths;
+  e.rounds += 1;
+  leaderboard.set(name, e);
+}
+
+function lbSnapshot() {
+  return [...leaderboard.entries()]
+    .map(([name, e]) => ({ name, kills:e.kills, deaths:e.deaths, rounds:e.rounds }))
+    .sort((a,b) => b.kills - a.kills || a.deaths - b.deaths)
+    .slice(0, 20);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ROUND MANAGEMENT
+// ══════════════════════════════════════════════════════════════════════════════
+const ROUND_DURATION_MS = 5 * 60 * 1000;
+const WINNER_SCREEN_MS  = 8 * 1000;
+
+const round = {
+  state:       "active",
+  endsAt:      Date.now() + ROUND_DURATION_MS,
+  winnerName:  null,
+  winnerKills: 0,
+  restartAt:   null,
+};
+
+function resetRound() {
+  round.state       = "active";
+  round.endsAt      = Date.now() + ROUND_DURATION_MS;
+  round.winnerName  = null;
+  round.winnerKills = 0;
+  round.restartAt   = null;
+  for (const [, p] of players) {
+    p.kills  = 0;
+    p.deaths = 0;
+    p.health = 100;
+    p.alive  = true;
+    p.pos    = spawnPos();
+    p.respawnTimer = 0;
+  }
+  broadcast({ type: "round_start" });
+  console.log("[ROUND] New round started");
+}
+
+function checkRoundEnd() {
+  if (round.state !== "active") return;
+  if (Date.now() < round.endsAt) return;
+  let winner = null;
+  for (const [, p] of players) {
+    if (!winner || p.kills > winner.kills || (p.kills === winner.kills && p.deaths < winner.deaths))
+      winner = p;
+  }
+  round.state       = "winner";
+  round.winnerName  = winner ? winner.name  : "Nobody";
+  round.winnerKills = winner ? winner.kills : 0;
+  round.restartAt   = Date.now() + WINNER_SCREEN_MS;
+  for (const [, p] of players) lbAdd(p.name, p.kills, p.deaths);
+  broadcast({
+    type:         "round_over",
+    winner_name:  round.winnerName,
+    winner_kills: round.winnerKills,
+    scores:       [...players.values()].map(p => ({ name: p.name, kills: p.kills, deaths: p.deaths })),
+    leaderboard:  lbSnapshot(),
+    restart_in:   WINNER_SCREEN_MS,
+  });
+  console.log(`[ROUND] Over — winner: ${round.winnerName} (${round.winnerKills} kills)`);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// GAME STATE
+// ══════════════════════════════════════════════════════════════════════════════
+const players     = new Map();
 let   nextPid     = 1;
 const eventsQueue = [];
 
@@ -495,23 +587,32 @@ function broadcast(msg) {
 // ══════════════════════════════════════════════════════════════════════════════
 // GAME LOOP
 // ══════════════════════════════════════════════════════════════════════════════
-const TICK_MS      = 1000 / TICK_RATE;
-const BCAST_MS     = 1000 / BROADCAST_RATE;
-let   lastBcast    = Date.now();
+const TICK_MS   = 1000 / TICK_RATE;
+const BCAST_MS  = 1000 / BROADCAST_RATE;
+let   lastBcast = Date.now();
 
 function gameTick() {
-  // Update all players (position comes from client via inp)
-  for (const [, p] of players) p.update();
+  if (round.state === "active") {
+    checkRoundEnd();
+  } else if (round.state === "winner" && Date.now() >= round.restartAt) {
+    resetRound();
+  }
 
-  // Broadcast at reduced rate
+  if (round.state === "active") {
+    for (const [, p] of players) p.update();
+  }
+
   const now = Date.now();
   if (now - lastBcast >= BCAST_MS) {
     lastBcast = now;
     broadcast({
-      type:    "state",
-      tick:    now,
-      players: [...players.values()].map(p => p.snapshot()),
-      events:  eventsQueue.splice(0),
+      type:        "state",
+      tick:        now,
+      players:     [...players.values()].map(p => p.snapshot()),
+      events:      eventsQueue.splice(0),
+      round_state: round.state,
+      time_left:   Math.max(0, round.endsAt - now),
+      leaderboard: lbSnapshot(),
     });
   }
 }
@@ -528,10 +629,12 @@ function onConnect(ws) {
   console.log(`[+] ${name} connected  (total: ${players.size})`);
 
   ws.send(JSON.stringify({
-    type:      "welcome",
-    your_pid:  pid,
-    spawn:     player.pos,
-    tick_rate: TICK_RATE,
+    type:        "welcome",
+    your_pid:    pid,
+    spawn:       player.pos,
+    tick_rate:   TICK_RATE,
+    round_state: round.state,
+    time_left:   Math.max(0, round.endsAt - Date.now()),
   }));
 
   ws.on("message", raw => {
@@ -540,14 +643,18 @@ function onConnect(ws) {
     const mtype = msg.type || "";
 
     if (mtype === "input") {
+      // Also track current weapon from input messages
+      if (msg.weapon) player.weapon = msg.weapon;
       player.inp = msg;
 
     } else if (mtype === "shoot") {
-      const yaw   = parseFloat(msg.yaw   ?? player.yaw);
-      const pitch = parseFloat(msg.pitch ?? player.pitch);
-      const hitPids = processShoot(player, players, yaw, pitch);
+      const yaw    = parseFloat(msg.yaw    ?? player.yaw);
+      const pitch  = parseFloat(msg.pitch  ?? player.pitch);
+      const weapon = msg.weapon || player.weapon || "pistol";
+
+      const hitPids = processShoot(player, players, yaw, pitch, weapon);
       if (hitPids.length) {
-        eventsQueue.push({ type:"hit", shooter:pid, targets:hitPids });
+        eventsQueue.push({ type:"hit", shooter:pid, targets:hitPids, weapon });
         for (const hpid of hitPids) {
           const hp = players.get(hpid);
           if (hp && !hp.alive) {
@@ -557,6 +664,7 @@ function onConnect(ws) {
               victim:      hpid,
               killer_name: player.name,
               victim_name: hp.name,
+              weapon:      weapon,
             });
           }
         }
@@ -564,6 +672,9 @@ function onConnect(ws) {
 
     } else if (mtype === "name") {
       player.name = String(msg.name || "").slice(0, 20);
+    } else if (mtype === "ping") {
+      // Echo back immediately so client can measure RTT
+      ws.send(JSON.stringify({ type: "pong", t: msg.t }));
     }
   });
 
@@ -581,15 +692,24 @@ function onConnect(ws) {
 const args = process.argv.slice(2);
 let   mapFile  = "ex.gltf";
 let   port     = DEFAULT_PORT;
+
 for (let i = 0; i < args.length; i++) {
   if (args[i] === "--port" && args[i+1]) { port = parseInt(args[++i]); }
   else if (!args[i].startsWith("--"))    { mapFile = args[i]; }
 }
 
 loadMap(mapFile);
+buildSpawnPoints();
 
-const wss = new WebSocket.Server({ port });
+const httpServer = http.createServer((req, res) => {
+  res.writeHead(200, { "Content-Type": "text/plain" });
+  res.end("FPS server running\n");
+});
+
+const wss = new WebSocket.Server({ server: httpServer });
 wss.on("connection", onConnect);
 setInterval(gameTick, TICK_MS);
 
-console.log(`[SERVER] Listening on ws://0.0.0.0:${port}`);
+httpServer.listen(port, () => {
+  console.log(`[SERVER] Listening on ws://0.0.0.0:${port}`);
+});
