@@ -1,13 +1,16 @@
 /**
  * FPS Multiplayer Server (Node.js)
  *
- * npm install ws
+ * npm install ws @supabase/supabase-js
  * node server.js [map.gltf] [--port 7777]
  *
- * Multi-weapon support:
- *   Pistol  — 25 dmg
- *   AR      — 18 dmg (auto)
- *   Sniper  — 100 dmg (one-shot kill)
+ * Serves:
+ *   GET  /           → client.html
+ *   GET  /assets/*   → static assets
+ *   GET  /ex.gltf    → map file
+ *   POST /auth/verify       → verify Supabase JWT token
+ *   GET  /auth/stats/:name  → get leaderboard stats for a user
+ *   WS   /           → game WebSocket
  */
 
 "use strict";
@@ -16,6 +19,27 @@ const http      = require("http");
 const WebSocket = require("ws");
 const fs        = require("fs");
 const path      = require("path");
+const url       = require("url");
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SUPABASE CONFIG
+// ══════════════════════════════════════════════════════════════════════════════
+const SUPABASE_URL      = process.env.SUPABASE_URL      || "https://epxfiwlozwvkpjviqfgm.supabase.co";
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImVweGZpd2xvend2a3BqdmlxZmdtIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMyOTQ2NTYsImV4cCI6MjA4ODg3MDY1Nn0.sfOQr7fLNR8PtiWgS_Po-9GWfdbc6g4qvjHZSm3ryKg"; // set via env var
+
+let supabase = null;
+try {
+  const { createClient } = require("@supabase/supabase-js");
+  if (SUPABASE_ANON_KEY) {
+    supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+    console.log("[SUPABASE] Client initialized");
+  } else {
+    console.warn("[SUPABASE] SUPABASE_ANON_KEY not set — auth disabled. Set it via env var.");
+  }
+} catch(e) {
+  console.warn("[SUPABASE] @supabase/supabase-js not installed — auth disabled.");
+  console.warn("           Run: npm install @supabase/supabase-js");
+}
 
 // ══════════════════════════════════════════════════════════════════════════════
 // CONFIG
@@ -31,13 +55,177 @@ const MAP_SCALE = 2.0;
 
 const RESPAWN_TICKS = 120;
 
-// Per-weapon damage
 const WEAPON_DAMAGE = {
   pistol: 25,
   ar:     8,
   sniper: 100,
 };
 const DEFAULT_DAMAGE = 25;
+
+// ══════════════════════════════════════════════════════════════════════════════
+// STATIC FILE SERVING
+// ══════════════════════════════════════════════════════════════════════════════
+const MIME_TYPES = {
+  ".html": "text/html",
+  ".js":   "application/javascript",
+  ".css":  "text/css",
+  ".gltf": "model/gltf+json",
+  ".glb":  "model/gltf-binary",
+  ".png":  "image/png",
+  ".jpg":  "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".bin":  "application/octet-stream",
+  ".json": "application/json",
+  ".ico":  "image/x-icon",
+  ".ktx2": "image/ktx2",
+  ".wasm": "application/wasm",
+  ".txt":  "text/plain",
+};
+
+function serveStatic(req, res) {
+  const parsedUrl = url.parse(req.url);
+  let reqPath     = decodeURIComponent(parsedUrl.pathname || "/");
+  if (reqPath === "/" || reqPath === "") reqPath = "/client.html";
+
+  const fullPath = path.resolve(__dirname, reqPath.replace(/^\//, ""));
+  if (fullPath !== __dirname && !fullPath.startsWith(__dirname + path.sep)) {
+    res.writeHead(403, { "Content-Type": "text/plain" });
+    res.end("Forbidden");
+    return;
+  }
+
+  const ext      = path.extname(fullPath).toLowerCase();
+  const mimeType = MIME_TYPES[ext] || "application/octet-stream";
+
+  fs.readFile(fullPath, (err, data) => {
+    if (err) {
+      res.writeHead(404, { "Content-Type": "text/plain" });
+      res.end("Not Found");
+      return;
+    }
+    res.writeHead(200, {
+      "Content-Type":  mimeType,
+      "Cache-Control": "no-cache",
+      "Access-Control-Allow-Origin": "*",
+    });
+    res.end(data);
+  });
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// AUTH API HANDLERS
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Read full body from request as a string.
+ */
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = "";
+    req.on("data", chunk => { body += chunk; if (body.length > 1e5) req.destroy(); });
+    req.on("end",  () => resolve(body));
+    req.on("error", reject);
+  });
+}
+
+function jsonResponse(res, status, data) {
+  const body = JSON.stringify(data);
+  res.writeHead(status, {
+    "Content-Type": "application/json",
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+  });
+  res.end(body);
+}
+
+/**
+ * POST /auth/verify
+ * Body: { token: "<supabase JWT>" }
+ * Returns: { ok: true, user_id, email, display_name, stats }
+ *
+ * The client sends the Supabase session access_token here.
+ * We verify it server-side, then load/upsert the player_stats row.
+ */
+async function handleAuthVerify(req, res) {
+  if (!supabase) return jsonResponse(res, 503, { ok: false, error: "Auth not configured" });
+
+  let body;
+  try { body = JSON.parse(await readBody(req)); }
+  catch(_) { return jsonResponse(res, 400, { ok: false, error: "Bad JSON" }); }
+
+  const token = body.token;
+  if (!token) return jsonResponse(res, 400, { ok: false, error: "Missing token" });
+
+  // Verify the JWT by fetching the user from Supabase
+  const { data: { user }, error } = await supabase.auth.getUser(token);
+  if (error || !user) return jsonResponse(res, 401, { ok: false, error: "Invalid token" });
+
+  // Load or create player stats row
+  const display_name = (user.user_metadata?.display_name || user.email?.split("@")[0] || "Player").slice(0, 20);
+
+  const { data: stats, error: statsErr } = await supabase
+    .from("player_stats")
+    .upsert({ user_id: user.id, display_name }, { onConflict: "user_id", ignoreDuplicates: false })
+    .select()
+    .single();
+
+  if (statsErr) console.error("[SUPABASE] Stats upsert error:", statsErr.message);
+
+  return jsonResponse(res, 200, {
+    ok: true,
+    user_id:      user.id,
+    email:        user.email,
+    display_name,
+    stats:        stats || null,
+  });
+}
+
+/**
+ * GET /auth/stats/:display_name
+ * Returns global stats for a given display name.
+ */
+async function handleGetStats(req, res, displayName) {
+  if (!supabase) return jsonResponse(res, 503, { ok: false, error: "Auth not configured" });
+
+  const { data, error } = await supabase
+    .from("player_stats")
+    .select("*")
+    .eq("display_name", displayName)
+    .single();
+
+  if (error || !data) {
+    return jsonResponse(res, 200, {
+      ok: true,
+      stats: { kills: 0, deaths: 0, rounds_played: 0 }
+    });
+  }
+
+  return jsonResponse(res, 200, { ok: true, stats: data });
+}
+
+/**
+ * Called at end of each round for logged-in players.
+ * Increments kills, deaths, rounds_played in Supabase.
+ */
+async function flushStatsToSupabase(name, kills, deaths) {
+  if (!supabase) return;
+
+  // Find player by display_name
+  const { data, error } = await supabase
+    .from("player_stats")
+    .select("user_id, kills, deaths, rounds_played")
+    .eq("display_name", name)
+    .single();
+
+  if (error || !data) return; // guest / not found
+
+  await supabase.from("player_stats").update({
+    kills:         (data.kills         || 0) + kills,
+    deaths:        (data.deaths        || 0) + deaths,
+    rounds_played: (data.rounds_played || 0) + 1,
+    updated_at:    new Date().toISOString(),
+  }).eq("user_id", data.user_id);
+}
 
 // ══════════════════════════════════════════════════════════════════════════════
 // MATH HELPERS
@@ -196,7 +384,6 @@ function loadMap(filePath) {
     const nc   = TNCO[acc.type] || 1;
     const bo   = bv.byteOffset || 0;
     const ao   = acc.byteOffset || 0;
-    const sz   = Ctor.BYTES_PER_ELEMENT * nc;
     const arr  = new Ctor(raw.buffer, raw.byteOffset + bo + ao, acc.count * nc);
     if (Ctor === Float32Array) return arr;
     const f = new Float32Array(arr.length);
@@ -385,9 +572,12 @@ class ServerPlayer {
     this.deaths = 0;
     this.respawnTimer = 0;
     this.sliding = false;
-    this.weapon  = "pistol";   // currently held weapon (cosmetic for server)
+    this.weapon  = "pistol";
     this.inp    = null;
     this.ws     = null;
+    // Auth info — null for guests
+    this.userId      = null;  // Supabase user_id
+    this.isLoggedIn  = false;
   }
 
   takeDamage(amount) {
@@ -424,25 +614,26 @@ class ServerPlayer {
 
   snapshot() {
     return {
-      pid:      this.pid,
-      name:     this.name,
-      x:        +this.pos[0].toFixed(3),
-      y:        +this.pos[1].toFixed(3),
-      z:        +this.pos[2].toFixed(3),
-      yaw:      +this.yaw.toFixed(2),
-      pitch:    +this.pitch.toFixed(2),
-      sliding:  this.sliding,
-      weapon:   this.weapon,
-      health:   this.health,
-      alive:    this.alive,
-      kills:    this.kills,
-      deaths:   this.deaths,
+      pid:        this.pid,
+      name:       this.name,
+      x:          +this.pos[0].toFixed(3),
+      y:          +this.pos[1].toFixed(3),
+      z:          +this.pos[2].toFixed(3),
+      yaw:        +this.yaw.toFixed(2),
+      pitch:      +this.pitch.toFixed(2),
+      sliding:    this.sliding,
+      weapon:     this.weapon,
+      health:     this.health,
+      alive:      this.alive,
+      kills:      this.kills,
+      deaths:     this.deaths,
+      isLoggedIn: this.isLoggedIn,
     };
   }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// HITSCAN  — damage amount depends on weapon
+// HITSCAN
 // ══════════════════════════════════════════════════════════════════════════════
 function processShoot(shooter, players, yaw, pitch, weapon) {
   const yr = yaw   * Math.PI / 180;
@@ -471,7 +662,6 @@ function processShoot(shooter, players, yaw, pitch, weapon) {
     const hy = eye[1] + dy*t;
     if (hy < cy || hy > cy+capH) continue;
 
-    // Wall occlusion check
     const wallT = raycastHitscan(eye[0], eye[1], eye[2], dx, dy, dz, t+0.5);
     if (wallT !== null && wallT < t - 0.3) continue;
 
@@ -487,7 +677,7 @@ function processShoot(shooter, players, yaw, pitch, weapon) {
     p.takeDamage(damage);
     hitPids.push(pid);
     if (wasAlive && !p.alive) shooter.kills++;
-    break; // one target per shot
+    break;
   }
   return hitPids;
 }
@@ -556,7 +746,15 @@ function checkRoundEnd() {
   round.winnerName  = winner ? winner.name  : "Nobody";
   round.winnerKills = winner ? winner.kills : 0;
   round.restartAt   = Date.now() + WINNER_SCREEN_MS;
-  for (const [, p] of players) lbAdd(p.name, p.kills, p.deaths);
+
+  for (const [, p] of players) {
+    lbAdd(p.name, p.kills, p.deaths);
+    // Flush to Supabase for logged-in players
+    if (p.isLoggedIn) {
+      flushStatsToSupabase(p.name, p.kills, p.deaths).catch(console.error);
+    }
+  }
+
   broadcast({
     type:         "round_over",
     winner_name:  round.winnerName,
@@ -629,12 +827,14 @@ function onConnect(ws) {
   console.log(`[+] ${name} connected  (total: ${players.size})`);
 
   ws.send(JSON.stringify({
-    type:        "welcome",
-    your_pid:    pid,
-    spawn:       player.pos,
-    tick_rate:   TICK_RATE,
-    round_state: round.state,
-    time_left:   Math.max(0, round.endsAt - Date.now()),
+    type:           "welcome",
+    your_pid:       pid,
+    spawn:          player.pos,
+    tick_rate:      TICK_RATE,
+    round_state:    round.state,
+    time_left:      Math.max(0, round.endsAt - Date.now()),
+    map_url:        "/ex.gltf",
+    auth_available: !!supabase,
   }));
 
   ws.on("message", raw => {
@@ -643,7 +843,6 @@ function onConnect(ws) {
     const mtype = msg.type || "";
 
     if (mtype === "input") {
-      // Also track current weapon from input messages
       if (msg.weapon) player.weapon = msg.weapon;
       player.inp = msg;
 
@@ -672,8 +871,57 @@ function onConnect(ws) {
 
     } else if (mtype === "name") {
       player.name = String(msg.name || "").slice(0, 20);
+
+    } else if (mtype === "auth_login") {
+      // Client sends Supabase session token after signing in via the browser
+      // We verify it via REST and update the player record
+      if (!supabase) {
+        ws.send(JSON.stringify({ type: "auth_result", ok: false, error: "Auth not available" }));
+        return;
+      }
+      const token = String(msg.token || "");
+      supabase.auth.getUser(token).then(({ data: { user }, error }) => {
+        if (error || !user) {
+          ws.send(JSON.stringify({ type: "auth_result", ok: false, error: "Invalid token" }));
+          return;
+        }
+        const display_name = (user.user_metadata?.display_name || user.email?.split("@")[0] || player.name).slice(0, 20);
+        player.name      = display_name;
+        player.userId    = user.id;
+        player.isLoggedIn = true;
+
+        // Load existing stats from Supabase
+        supabase.from("player_stats")
+          .select("kills, deaths, rounds_played")
+          .eq("user_id", user.id)
+          .single()
+          .then(({ data: stats }) => {
+            ws.send(JSON.stringify({
+              type:         "auth_result",
+              ok:           true,
+              display_name,
+              career_stats: stats || { kills: -1, deaths: 0, rounds_played: 0 },
+            }));
+          });
+
+        // Ensure row exists
+        supabase.from("player_stats")
+          .upsert({ user_id: user.id, display_name }, { onConflict: "user_id", ignoreDuplicates: true })
+          .then(() => {});
+
+        console.log(`[AUTH] ${display_name} logged in (uid: ${user.id.slice(0,8)}...)`);
+      }).catch(err => {
+        ws.send(JSON.stringify({ type: "auth_result", ok: false, error: err.message }));
+      });
+
+    } else if (mtype === "auth_logout") {
+      player.userId    = null;
+      player.isLoggedIn = false;
+      ws.send(JSON.stringify({ type: "auth_result", ok: true, logged_out: true }));
+      console.log(`[AUTH] ${player.name} logged out`);
+      player.name = `Player${pid}`;
+
     } else if (mtype === "ping") {
-      // Echo back immediately so client can measure RTT
       ws.send(JSON.stringify({ type: "pong", t: msg.t }));
     }
   });
@@ -701,15 +949,39 @@ for (let i = 0; i < args.length; i++) {
 loadMap(mapFile);
 buildSpawnPoints();
 
-const httpServer = http.createServer((req, res) => {
-  res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end(` server running on port ${port}\n`);
+// ── HTTP server — serves static files, auth REST routes, and WS ─────────────
+const httpServer = http.createServer(async (req, res) => {
+  const parsedUrl = url.parse(req.url);
+  const pathname  = parsedUrl.pathname || "/";
+
+  // CORS preflight
+  if (req.method === "OPTIONS") {
+    res.writeHead(204, {
+      "Access-Control-Allow-Origin":  "*",
+      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    });
+    res.end();
+    return;
+  }
+
+  // Auth routes
+  if (req.method === "POST" && pathname === "/auth/verify") {
+    return handleAuthVerify(req, res);
+  }
+  if (req.method === "GET" && pathname.startsWith("/auth/stats/")) {
+    const name = decodeURIComponent(pathname.replace("/auth/stats/", ""));
+    return handleGetStats(req, res, name);
+  }
+
+  serveStatic(req, res);
 });
 
 const wss = new WebSocket.Server({ server: httpServer });
 wss.on("connection", onConnect);
 setInterval(gameTick, TICK_MS);
 
-httpServer.listen(port, () => {
-  console.log(`[SERVER] Listening on ws://0.0.0.0:${port}`);
+httpServer.listen(port, "0.0.0.0", () => {
+  console.log(`[SERVER] HTTP + WS listening on http://0.0.0.0:${port}`);
+  console.log(`[SERVER] Open your browser at http://localhost:${port}`);
 });
